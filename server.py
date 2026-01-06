@@ -493,9 +493,12 @@ if __name__ == '__main__':
         cur.close()
         conn.close()
         
+# server.py (Indentation Correction)
+# ...
+        
         # Run the Flask app
         print("Starting Flask app...")
-        if __name__ == "__main__":
-    app.run()
+        if __name__ == "__main__": 
+            app.run()  # <-- Must be indented!
     except Exception as e:
         print(f"Error starting server: {e}")
