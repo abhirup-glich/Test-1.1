@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: test-1-1
+    env: python
+    plan: free
+    pythonVersion: 3.11.9
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+    startCommand: gunicorn server:app
