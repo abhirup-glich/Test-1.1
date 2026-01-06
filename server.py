@@ -1,504 +1,549 @@
-# server.py
-from flask import Flask, request, jsonify, send_from_directory, Blueprint
-from flask_cors import CORS
-import os
-from datetime import datetime, timedelta
-import subprocess
+import cv2
+import numpy as np
+import torch
+import time
+import threading
 import sys
-import json
-from Logic import logic  # Import your logic module
-from werkzeug.utils import secure_filename
-from Logic.logic import connect_db, setup_db, mark_attendance
-from Logic import logic as logic_mod
-import logging
- 
-app = Flask(__name__, static_folder='WebPage', static_url_path='/WebPage')
-api = Blueprint('api', __name__, url_prefix='/api')
-cors = CORS(app, resources={r"/api/*": {"origins": ["http://localhost:5000", "http://127.0.0.1:5000"]}}, supports_credentials=True)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+import base64
+from datetime import datetime
+import psycopg2
+import psycopg2.extras
+from facenet_pytorch import MTCNN, InceptionResnetV1
+import dlib
+from imutils import face_utils
+from tabulate import tabulate
+import argparse
+import os
 
-@app.after_request
-def add_security_headers(resp):
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["X-XSS-Protection"] = "1; mode=block"
-    path = request.path.lower()
-    if path.endswith('.js') or path.endswith('.css'):
-        resp.headers["Cache-Control"] = "public, max-age=604800"
-    elif path.endswith('.html'):
-        resp.headers["Cache-Control"] = "no-cache"
-    return resp
+# ===================== CONFIG =====================
 
-# Configuration
-UPLOAD_FOLDER = 'uploads'
-ALLOWED_EXTENSIONS = {'webm', 'mp4', 'mov'}
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "localhost"),
+    "database": os.getenv("DB_NAME", "face_recognition_db"),
+    "user": os.getenv("DB_USER", "postgres"),
+    # FIX 3: Removed hardcoded default password for security
+    "password": os.getenv("DB_PASSWORD", ""), 
+    "port": os.getenv("DB_PORT", "5432"),
+}
 
-# Ensure upload directory exists
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+MATCH_THRESHOLD = 0.65
+BLINK_THRESHOLD = 0.20
+REQUIRED_BLINKS = 2
+HEAD_FRAMES = 8
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+exit_attendance = False
 
-@app.route("/set_cookie", methods=["POST", "OPTIONS"])
-def set_cookie():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    data = request.get_json(silent=True) or {}
-    name = data.get("name", "fast_auth")
-    value = data.get("value", "token")
-    max_age = data.get("max_age", 3600)
-    secure = bool(data.get("secure", False))
-    resp = jsonify({"ok": True})
-    resp.set_cookie(
-        key=name,
-        value=value,
-        max_age=max_age,
-        expires=timedelta(seconds=max_age),
-        httponly=True,
-        samesite="None",
-        secure=secure,
-        domain="localhost",
-        path="/",
-    )
-    return resp
+# ===================== MODELS =====================
 
-@app.route("/echo_cookie", methods=["GET", "OPTIONS"])
-def echo_cookie():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    name = request.args.get("name", "fast_auth")
-    val = request.cookies.get(name)
-    return jsonify({"cookie": {name: val}}), 200
+mtcnn = MTCNN(keep_all=False, device=DEVICE)
+facenet = InceptionResnetV1(pretrained="vggface2").eval().to(DEVICE)
+# This path relies on 'shape_predictor_68_face_landmarks.dat' being in the same directory as logic.py
+predictor = dlib.shape_predictor(os.path.join(os.path.dirname(__file__), "shape_predictor_68_face_landmarks.dat"))
 
-def upload_video_impl():
-    if 'video' not in request.files:
-        return jsonify({'error': 'No video file provided'}), 400
-    
-    file = request.files['video']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    
-    if file and allowed_file(file.filename):
-        try:
-            # Save the file with timestamp
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"attendance_{timestamp}.webm"
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(filepath)
+# ===================== DATABASE =====================
+
+def connect_db():
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    return conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+def setup_db(cur):
+    # Create tables only if they don't exist
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS students (
+            roll TEXT PRIMARY KEY,
+            name TEXT,
+            course TEXT,
+            emb_left FLOAT8[],
+            emb_center FLOAT8[],
+            emb_right FLOAT8[]
+        );
+        
+        CREATE TABLE IF NOT EXISTS attendance (
+            id SERIAL PRIMARY KEY,
+            roll TEXT,
+            name TEXT,
+            course TEXT,
+            time TIMESTAMP,
+            confidence FLOAT8
+        );
+        
+        CREATE TABLE IF NOT EXISTS classes (
+            id SERIAL PRIMARY KEY,
+            course TEXT,
+            start_time TIMESTAMP DEFAULT NOW(),
+            notes TEXT
+        );
+        
+        -- Add comments to document the schema (only if they don't exist)
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_description 
+                WHERE objoid = 'students'::regclass AND objsubid = 0
+            ) THEN
+                COMMENT ON TABLE students IS 'Stores student information and face embeddings';
+            END IF;
             
-            # Call the face recognition logic
-            conn, cur = connect_db()
-            result = mark_attendance(cur, video_path=filepath)
-            cur.close()
-            conn.close()
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_description 
+                WHERE objoid = 'attendance'::regclass AND objsubid = 0
+            ) THEN
+                COMMENT ON TABLE attendance IS 'Stores attendance records';
+            END IF;
             
-            if result.get('status') == 'success':
-                return jsonify({
-                    'message': 'Attendance marked successfully',
-                    'data': {
-                        'name': result['name'],
-                        'roll': result['roll'],
-                        'time': result['time'],
-                        'confidence': result['confidence']
-                    }
-                })
-            else:
-                return jsonify({
-                    'status': result.get('status', 'error'),
-                    'message': 'No students found' if result.get('status') == 'no_student' else result.get('error', 'Attendance not marked'),
-                    'time': result.get('time')
-                }), 200 if result.get('status') in ['no_student', 'no_face'] else 400
-                
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
- 
-@api.route('/upload', methods=['POST'])
-def api_upload_video():
-    return upload_video_impl()
- 
-@app.route('/upload', methods=['POST'])
-def upload_video():
-    return upload_video_impl()
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_description 
+                WHERE objoid = 'classes'::regclass AND objsubid = 0
+            ) THEN
+                COMMENT ON TABLE classes IS 'Logs each class session start';
+            END IF;
+        END $$;
+    """)
 
-@app.route('/api/upload', methods=['POST'])
-def api_upload_video_direct():
-    return upload_video_impl()
+# ===================== UTILS =====================
 
-def check_attendance_impl():
+def normalize(v):
+    v = np.asarray(v, dtype=np.float32).flatten()
+    n = np.linalg.norm(v)
+    return v if n == 0 else v / n
+
+def cosine_sim(a, b):
+    a, b = normalize(a), normalize(b)
+    if a.shape != b.shape:
+        return -1.0
+    return float(np.dot(a, b))
+
+def get_embedding(face):
+    face = cv2.resize(face, (160,160))
+    face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+    t = torch.tensor(face).permute(2,0,1).float().unsqueeze(0)/255.0
+    t = t.to(DEVICE)
+    with torch.no_grad():
+        emb = facenet(t).cpu().numpy()[0]
+    return normalize(emb)
+
+# ===================== REGISTRATION =====================
+
+def capture_embeddings(cap, prompt, samples=20):
+    data = []
+    while len(data) < samples:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        box, _ = mtcnn.detect(rgb)
+        if box is not None:
+            x1,y1,x2,y2 = map(int, box[0])
+            face = frame[y1:y2, x1:x2]
+            data.append(get_embedding(face))
+            cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
+        cv2.putText(frame,f"{prompt} {len(data)}/{samples}",
+                    (30,60),cv2.FONT_HERSHEY_SIMPLEX,1,(0,255,255),3)
+        cv2.imshow("Register",frame)
+        cv2.waitKey(1)
+    return normalize(np.mean(data, axis=0))
+
+def register_student(cur):
+    roll = input("Roll: ")
+    name = input("Name: ")
+    course = input("Course: ")
+
+    cap = cv2.VideoCapture(0)
+    center = capture_embeddings(cap, "LOOK STRAIGHT")
+    left = capture_embeddings(cap, "TURN LEFT")
+    right = capture_embeddings(cap, "TURN RIGHT")
+    cap.release()
+    cv2.destroyAllWindows()
+
+    cur.execute("""
+        INSERT INTO students (roll, name, course, emb_left, emb_center, emb_right) 
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (roll) DO UPDATE SET
+        name = EXCLUDED.name,
+        course = EXCLUDED.course,
+        emb_left = EXCLUDED.emb_left,
+        emb_center = EXCLUDED.emb_center,
+        emb_right = EXCLUDED.emb_right
+    """,(roll,name,course,
+         left.tolist(),center.tolist(),right.tolist()))
+
+    print(f"Registered: {name}")
+
+def process_web_image(base64_str):
     try:
-        conn, cur = logic.connect_db()
+        # Decode base64
+        if ',' in base64_str:
+            base64_str = base64_str.split(',')[1]
+        img_data = base64.b64decode(base64_str)
+        nparr = np.frombuffer(img_data, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        # Detect face
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        box, _ = mtcnn.detect(rgb)
+        
+        if box is None:
+            return None
+            
+        # Get largest face if multiple
+        # Simple approach: just take first one for now or max area
+        x1,y1,x2,y2 = map(int, box[0])
+        h, w = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        
+        face = frame[y1:y2, x1:x2]
+        if face.size == 0:
+            return None
+            
+        return get_embedding(face)
+    except Exception as e:
+        print(f"Error processing web image: {e}")
+        return None
+
+def register_student_web(cur, roll, name, course, images):
+    # images is dict with keys: center, left, right
+    
+    emb_center = process_web_image(images['center'])
+    if emb_center is None:
+        return {'status': 'error', 'message': 'Face not detected in Center photo'}
+        
+    emb_left = process_web_image(images['left'])
+    if emb_left is None:
+        return {'status': 'error', 'message': 'Face not detected in Left photo'}
+        
+    emb_right = process_web_image(images['right'])
+    if emb_right is None:
+        return {'status': 'error', 'message': 'Face not detected in Right photo'}
+        
+    try:
         cur.execute("""
-            SELECT s.roll, s.name, s.course, a.time, a.confidence 
-            FROM attendance a
-            JOIN students s ON a.roll = s.roll
-            ORDER BY a.time DESC
+            INSERT INTO students (roll, name, course, emb_left, emb_center, emb_right) 
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (roll) DO UPDATE SET
+            name = EXCLUDED.name,
+            course = EXCLUDED.course,
+            emb_left = EXCLUDED.emb_left,
+            emb_center = EXCLUDED.emb_center,
+            emb_right = EXCLUDED.emb_right
+        """,(roll, name, course,
+             emb_left.tolist(), emb_center.tolist(), emb_right.tolist()))
+             
+        return {'status': 'success', 'message': f'Student {name} registered successfully'}
+    except Exception as e:
+        print(f"DB Error: {e}")
+        return {'status': 'error', 'message': str(e)}
+
+# ===================== ATTENDANCE =====================
+
+def load_students(cur):
+    cur.execute("SELECT * FROM students")
+    students = []
+    for s in cur.fetchall():
+        students.append((
+            s,
+            [normalize(s["emb_left"]),
+             normalize(s["emb_center"]),
+             normalize(s["emb_right"])]
+        ))
+    return students
+
+def terminal_listener():
+    global exit_attendance
+    while True:
+        if sys.stdin.readline().strip().lower() == "q":
+            exit_attendance = True
+            break
+            
+def record_class_start(cur, course=None, notes=None):
+    try:
+        cur.execute("""
+            INSERT INTO classes (course, notes)
+            VALUES (%s, %s)
+            RETURNING id, start_time, course
+        """, (course, notes))
+        rec = cur.fetchone()
+        return {
+            "status": "success",
+            "class_id": rec["id"],
+            "start_time": rec["start_time"].isoformat(),
+            "course": rec["course"]
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+def mark_attendance(cur, video_path=None):
+    cap = None
+    try:
+        students = load_students(cur)
+        if not students:
+            return {"error": "No students registered"}
+
+        # Use video file if provided, otherwise use webcam
+        if video_path:
+            cap = cv2.VideoCapture(video_path)
+        else:
+            cap = cv2.VideoCapture(0)
+            
+        if not cap.isOpened():
+            return {"error": "Could not open video source"}
+
+        marked = set()
+        blink = 0
+        nose_track = []
+        start_time = time.time()
+        attendance_marked = False
+        saw_face = False
+        result = {"status": "no_face", "name": None, "roll": None, "time": None, "confidence": 0.0}
+
+        print(f"\nAttendance check starting - Source: {'File' if video_path else 'Webcam'}")
+
+        while True:  # Process until end of stream or timeout
+            # For webcam, limit to 5 seconds. For file, process until end or success
+            if not video_path and time.time() - start_time > 5:
+                break
+                
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            box, _ = mtcnn.detect(rgb)
+
+            if box is not None:
+                x1, y1, x2, y2 = map(int, box[0])
+                # Ensure coordinates are within frame
+                h, w = frame.shape[:2]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+                
+                face = frame[y1:y2, x1:x2]
+                
+                # Skip if face is too small
+                if face.size == 0:
+                    continue
+                
+                saw_face = True
+                    
+                rect = dlib.rectangle(x1, y1, x2, y2)
+
+                shape = face_utils.shape_to_np(predictor(gray, rect))
+                nose_track.append(shape[30])
+                if len(nose_track) > HEAD_FRAMES:
+                    nose_track.pop(0)
+
+                leftEye = shape[36:42]
+                ear = (np.linalg.norm(leftEye[1]-leftEye[5]) +
+                       np.linalg.norm(leftEye[2]-leftEye[4])) / \
+                      (2*np.linalg.norm(leftEye[0]-leftEye[3]))
+
+                if ear < BLINK_THRESHOLD:
+                    blink += 1
+
+                if not video_path:
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                
+                can_mark = False
+                if video_path:
+                    can_mark = True 
+                else:
+                    if blink >= REQUIRED_BLINKS:
+                        can_mark = True
+                    elif len(nose_track) < HEAD_FRAMES:
+                        pass
+                        
+                if can_mark and not attendance_marked:
+                    emb = get_embedding(face)
+                    best_score, best_student = -1, None
+
+                    for s, embs in students:
+                        if s["roll"] in marked:
+                            continue
+                        for db_emb in embs:
+                            score = cosine_sim(emb, db_emb)
+                            if score > best_score:
+                                best_score, best_student = score, s
+
+                    if best_score > 0.6:  # Confidence threshold
+                        timestamp = datetime.now()
+                        cur.execute("""
+                            INSERT INTO attendance (roll, name, course, time, confidence)
+                            VALUES (%s, %s, %s, %s, %s)
+                            RETURNING id, time
+                        """, (best_student["roll"], best_student["name"], 
+                             best_student["course"], timestamp, best_score))
+                        
+                        # Get the inserted record
+                        attendance_record = cur.fetchone()
+                        marked.add(best_student["roll"])
+                        print(f"Marked: {best_student['name']} ({best_score:.2f})")
+                        attendance_marked = True
+                        
+                        # Update result
+                        result = {
+                            "status": "success",
+                            "name": best_student["name"],
+                            "roll": best_student["roll"],
+                            "time": attendance_record["time"].isoformat(),
+                            "confidence": float(best_score)
+                        }
+                        
+                        if not video_path:
+                            cv2.putText(frame, "ATTENDANCE MARKED", (40, 160),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                        else:
+                            # If processing a file and we found a match, we can stop
+                            break
+                    else:
+                        if not video_path:
+                            cv2.putText(frame, "UNKNOWN FACE", (40, 160),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+            # Show remaining time only for webcam
+            if not video_path:
+                elapsed = time.time() - start_time
+                remaining = max(0, 5 - int(elapsed))
+                cv2.putText(frame, f"Time: {remaining}s", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                
+                cv2.imshow("Attendance", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+        
+        if not attendance_marked:
+            result["status"] = "no_student" if saw_face else "no_face"
+            result["time"] = datetime.now().isoformat()
+            result["confidence"] = 0.0
+            
+    except Exception as e:
+        print(f"Error in mark_attendance: {e}")
+        return {"error": str(e)}
+    finally:
+        if cap and cap.isOpened():
+            cap.release()
+        if not video_path:
+            cv2.destroyAllWindows()
+    
+    return result
+# ===================== EDIT DATABASE =====================
+
+def edit_database(cur):
+    cur.execute("SELECT roll,name,course FROM students ORDER BY roll")
+    rows = cur.fetchall()
+    print(tabulate([[i+1,r["roll"],r["name"],r["course"]]
+                    for i,r in enumerate(rows)],
+                   headers=["SL","Roll","Name","Course"],
+                   tablefmt="grid"))
+    roll = input("Roll to edit: ")
+    print("1.Update Name\n2.Update Course\n3.Delete")
+    ch = input("Choice: ")
+
+    if ch == "1":
+        cur.execute("UPDATE students SET name=%s WHERE roll=%s",
+                    (input("New Name: "),roll))
+    elif ch == "2":
+        cur.execute("UPDATE students SET course=%s WHERE roll=%s",
+                    (input("New Course: "),roll))
+    elif ch == "3":
+        cur.execute("DELETE FROM students WHERE roll=%s",(roll,))
+    print("Updated")
+
+# ===================== DATABASE OPERATIONS =====================
+
+def delete_last_attendance(cur):
+    try:
+        cur.execute("""
+            DELETE FROM attendance 
+            WHERE id = (
+                SELECT id FROM attendance 
+                ORDER BY time DESC 
+                LIMIT 1
+            )
+            RETURNING id, name, time
         """)
-        results = cur.fetchall()
-        cur.close()
-        conn.close()
-        
-        # Convert datetime to string for JSON serialization
-        attendance_list = []
-        for row in results:
-            row_dict = dict(row)
-            row_dict['time'] = row_dict['time'].isoformat() if row_dict['time'] else None
-            attendance_list.append(row_dict)
-            
-        return jsonify({
-            'status': 'success',
-            'attendance': attendance_list
-        })
-        
+        deleted = cur.fetchone()
+        return deleted
     except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'error': str(e)
-        }), 500
- 
-@api.route('/check_attendance', methods=['GET'])
-def api_check_attendance():
-    return check_attendance_impl()
- 
-@app.route('/check_attendance', methods=['GET'])
-def check_attendance():
-    return check_attendance_impl()
+        print(f"Error deleting last attendance: {e}")
+        return None
 
-@app.route('/api/check_attendance', methods=['GET'])
-def api_check_attendance_direct():
-    return check_attendance_impl()
-
-def register_student_impl():
+def clear_all_attendance(cur):
     try:
-        data = request.json
-        roll = data.get('roll')
-        name = data.get('name')
-        course = data.get('course')
-        images = data.get('images') # Expects {center: '...', left: '...', right: '...'}
-        
-        if not all([roll, name, course, images]):
-            return jsonify({'error': 'Missing required fields'}), 400
-            
-        conn, cur = logic.connect_db()
-        result = logic.register_student_web(cur, roll, name, course, images)
-        conn.close()
-        
-        if result['status'] == 'success':
-            return jsonify(result)
-        else:
-            return jsonify(result), 400
-        
+        cur.execute("DELETE FROM attendance")
+        return True
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
- 
-@api.route('/register_student', methods=['POST'])
-def api_register_student():
-    return register_student_impl()
- 
-@app.route('/register_student', methods=['POST'])
-def register_student():
-    return register_student_impl()
+        print(f"Error clearing all attendance: {e}")
+        return False
 
-@app.route('/api/register_student', methods=['POST'])
-def api_register_student_direct():
-    return register_student_impl()
-
-def delete_last_attendance_impl():
+def fetch_all_students(cur):
     try:
-        conn, cur = logic.connect_db()
-        deleted = logic.delete_last_attendance(cur)
-        conn.close()
-        
-        if deleted:
-            return jsonify({
-                'status': 'success',
-                'message': f"Deleted attendance for {deleted['name']} at {deleted['time']}"
-            })
-        else:
-            return jsonify({
-                'status': 'error',
-                'message': 'No attendance record found to delete'
-            }), 404
-            
+        cur.execute("SELECT roll, name, course FROM students ORDER BY roll")
+        return cur.fetchall()
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
- 
-@api.route('/delete_last_attendance', methods=['POST'])
-def api_delete_last_attendance_route():
-    return delete_last_attendance_impl()
- 
-@app.route('/delete_last_attendance', methods=['POST'])
-def delete_last_attendance_route():
-    return delete_last_attendance_impl()
+        print(f"Error fetching students: {e}")
+        return []
 
-@app.route('/api/delete_last_attendance', methods=['POST'])
-def api_delete_last_attendance_direct():
-    return delete_last_attendance_impl()
-
-def clear_all_attendance_impl():
+def update_student_record(cur, roll, name=None, course=None):
     try:
-        conn, cur = logic.connect_db()
-        success = logic.clear_all_attendance(cur)
-        conn.close()
-        
-        if success:
-            return jsonify({
-                'status': 'success',
-                'message': 'All attendance records cleared'
-            })
-        else:
-            return jsonify({
-                'status': 'error',
-                'message': 'Failed to clear attendance'
-            }), 500
-            
+        if name and course:
+            cur.execute("UPDATE students SET name=%s, course=%s WHERE roll=%s", (name, course, roll))
+        elif name:
+            cur.execute("UPDATE students SET name=%s WHERE roll=%s", (name, roll))
+        elif course:
+            cur.execute("UPDATE students SET course=%s WHERE roll=%s", (course, roll))
+        return True
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
- 
-@api.route('/clear_all_attendance', methods=['POST'])
-def api_clear_all_attendance_route():
-    return clear_all_attendance_impl()
- 
-@app.route('/clear_all_attendance', methods=['POST'])
-def clear_all_attendance_route():
-    return clear_all_attendance_impl()
+        print(f"Error updating student: {e}")
+        return False
 
-@app.route('/api/clear_all_attendance', methods=['POST'])
-def api_clear_all_attendance_direct():
-    return clear_all_attendance_impl()
-
-def get_students_impl():
+def delete_student_record(cur, roll):
     try:
-        conn, cur = logic.connect_db()
-        students = logic.fetch_all_students(cur)
-        conn.close()
-        return jsonify({'students': students})
+        cur.execute("DELETE FROM students WHERE roll=%s", (roll,))
+        return True
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
- 
-@api.route('/students', methods=['GET'])
-def api_get_students():
-    return get_students_impl()
- 
-@app.route('/students', methods=['GET'])
-def get_students():
-    return get_students_impl()
+        print(f"Error deleting student: {e}")
+        return False
 
-# Explicit /api routes without blueprint (compat)
-@app.route('/api/students', methods=['GET'])
-def api_students_direct():
-    return get_students_impl()
+# ===================== MAIN =====================
 
-def class_start_impl():
-    try:
-        data = request.json if request.is_json else {}
-        course = data.get('course')
-        notes = data.get('notes')
-        conn, cur = logic.connect_db()
-        result = logic.record_class_start(cur, course, notes)
-        conn.close()
-        if result.get('status') == 'success':
-            return jsonify(result)
-        else:
-            return jsonify(result), 400
-    except Exception as e:
-        return jsonify({'status': 'error', 'error': str(e)}), 500
- 
-@api.route('/class_start', methods=['POST'])
-def api_class_start():
-    return class_start_impl()
- 
-@app.route('/class_start', methods=['POST'])
-def class_start():
-    return class_start_impl()
+def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Face Recognition Attendance System')
+    parser.add_argument('--mode', choices=['register', 'attendance', 'view'], 
+                       help='Run in specific mode: register, attendance, or view attendance')
+    args = parser.parse_args()
+    
+    conn, cur = connect_db()
+    setup_db(cur) # Setup DB tables before running modes
+    
+    if args.mode == 'register':
+        register_student(cur)
+        return
+    elif args.mode == 'attendance':
+        mark_attendance(cur)
+        return
+    elif args.mode == 'view':
+        cur.execute("SELECT * FROM attendance ORDER BY time DESC")
+        print(tabulate(cur.fetchall(),headers="keys",tablefmt="grid"))
+        return
+    
+    while True:
+        print("\n1.Register\n2.Attendance\n3.View Attendance\n4.Edit Database\n5.Exit")
+        ch = input("Select: ")
 
-@app.route('/api/class_start', methods=['POST'])
-def api_class_start_direct():
-    return class_start_impl()
+        if ch=="1": register_student(cur)
+        elif ch=="2": mark_attendance(cur)
+        elif ch=="3":
+            cur.execute("SELECT * FROM attendance ORDER BY time DESC")
+            print(tabulate(cur.fetchall(),headers="keys",tablefmt="grid"))
+        elif ch=="4": edit_database(cur)
+        elif ch=="5": break
 
-def update_student_impl(roll):
-    try:
-        data = request.json
-        conn, cur = logic.connect_db()
-        success = logic.update_student_record(cur, roll, data.get('name'), data.get('course'))
-        conn.close()
-        
-        if success:
-            return jsonify({'status': 'success', 'message': 'Student updated'})
-        else:
-            return jsonify({'status': 'error', 'message': 'Update failed'}), 400
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
- 
-@api.route('/students/<roll>', methods=['PUT'])
-def api_update_student(roll):
-    return update_student_impl(roll)
- 
-@app.route('/students/<roll>', methods=['PUT'])
-def update_student(roll):
-    return update_student_impl(roll)
+    cur.close()
+    conn.close()
 
-@app.route('/api/students/<roll>', methods=['PUT'])
-def api_update_student_direct(roll):
-    return update_student_impl(roll)
-
-def delete_student_impl(roll):
-    try:
-        conn, cur = logic.connect_db()
-        success = logic.delete_student_record(cur, roll)
-        conn.close()
-        
-        if success:
-            return jsonify({'status': 'success', 'message': 'Student deleted'})
-        else:
-            return jsonify({'status': 'error', 'message': 'Delete failed'}), 400
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
- 
-@api.route('/students/<roll>', methods=['DELETE'])
-def api_delete_student(roll):
-    return delete_student_impl(roll)
- 
-@app.route('/students/<roll>', methods=['DELETE'])
-def delete_student(roll):
-    return delete_student_impl(roll)
-
-@app.route('/api/students/<roll>', methods=['DELETE'])
-def api_delete_student_direct(roll):
-    return delete_student_impl(roll)
-
-@app.route('/')
-def root_index():
-    return send_from_directory(os.path.join(app.root_path, 'WebPage'), 'FAST V2.html')
-
-@app.route('/admin')
-def admin_page():
-    return send_from_directory(os.path.join(app.root_path, 'WebPage', 'Admin Page'), 'admin.html')
-
-@app.route('/Admin')
-def admin_page_caps():
-    return send_from_directory(os.path.join(app.root_path, 'WebPage', 'Admin Page'), 'admin.html')
-
-@app.route('/admin.html')
-def admin_html_route():
-    return send_from_directory(os.path.join(app.root_path, 'WebPage', 'Admin Page'), 'admin.html')
-
-@app.route('/serveradmin')
-def server_admin_page():
-    return send_from_directory(os.path.join(app.root_path, 'WebPage', 'Admin Page'), 'serveradmin.html')
-
-@app.route('/serveradmin.html')
-def server_admin_html_route():
-    return send_from_directory(os.path.join(app.root_path, 'WebPage', 'Admin Page'), 'serveradmin.html')
-
-@app.route('/assets/<path:path>')
-def assets(path):
-    return send_from_directory(os.path.join(app.root_path, 'WebPage', 'assets'), path)
-
-@app.route('/WebPage/<path:path>')
-def serve_webpage_path(path):
-    return send_from_directory(os.path.join(app.root_path, 'WebPage'), path)
-
-@app.route('/Loginv2/<path:path>')
-def login_assets(path):
-    return send_from_directory(os.path.join(app.root_path, 'WebPage', 'Loginv2'), path)
-
-@app.route('/Admin Page/<path:path>')
-def admin_assets(path):
-    return send_from_directory(os.path.join(app.root_path, 'WebPage', 'Admin Page'), path)
-
-@app.route('/studentdashboard')
-def student_dashboard():
-    return send_from_directory(os.path.join(app.root_path, 'WebPage', 'Student page'), 'studentdashboard.html')
-
-@app.route('/PrivacyPolicy.html')
-def privacy_policy():
-    return send_from_directory(os.path.join(app.root_path, 'WebPage'), 'PrivacyPolicy.html')
-
-@app.route('/TermsOfService.html')
-def terms_of_service():
-    return send_from_directory(os.path.join(app.root_path, 'WebPage'), 'TermsOfService.html')
-
-@app.route('/GetStarted.html')
-def get_started():
-    return send_from_directory(os.path.join(app.root_path, 'WebPage'), 'GetStarted.html')
-
-@app.route('/LoginAs.html')
-def login_as():
-    return send_from_directory(os.path.join(app.root_path, 'WebPage'), 'LoginAs.html')
-
-@app.route('/LearnMore.html')
-def learn_more():
-    return send_from_directory(os.path.join(app.root_path, 'WebPage'), 'LearnMore.html')
-
-
-@app.errorhandler(404)
-def handle_404(e):
-    if request.path.startswith('/api/'):
-        return jsonify({'error': 'Not Found'}), 404
-    return send_from_directory(os.path.join(app.root_path, 'WebPage'), 'FAST V2.html')
-
-@app.errorhandler(500)
-def handle_500(e):
-    if request.path.startswith('/api/'):
-        return jsonify({'error': 'Server Error'}), 500
-    return send_from_directory(os.path.join(app.root_path, 'WebPage'), 'FAST V2.html')
-
-@app.before_request
-def log_request():
-    logging.info("%s %s", request.method, request.path)
-
-app.register_blueprint(api)
-for rule in app.url_map.iter_rules():
-    print(str(rule))
-
-@app.route('/api/<path:subpath>', methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'])
-def api_fallback(subpath):
-    try:
-        if subpath == 'upload' and request.method == 'POST':
-            return upload_video_impl()
-        if subpath == 'check_attendance' and request.method == 'GET':
-            return check_attendance_impl()
-        if subpath == 'register_student' and request.method == 'POST':
-            return register_student_impl()
-        if subpath == 'delete_last_attendance' and request.method == 'POST':
-            return delete_last_attendance_impl()
-        if subpath == 'clear_all_attendance' and request.method == 'POST':
-            return clear_all_attendance_impl()
-        if subpath == 'students' and request.method == 'GET':
-            return get_students_impl()
-        if subpath.startswith('students/') and request.method in ['PUT', 'DELETE']:
-            roll = subpath.split('/', 1)[1]
-            if request.method == 'PUT':
-                return update_student_impl(roll)
-            if request.method == 'DELETE':
-                return delete_student_impl(roll)
-        if subpath == 'class_start' and request.method == 'POST':
-            return class_start_impl()
-        return jsonify({'error': 'Not Found'}), 404
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/debug/routes', methods=['GET'])
-def debug_routes():
-    return jsonify({'routes': [str(rule) for rule in app.url_map.iter_rules()]})
-if __name__ == '__main__':
-    print("Starting server setup...")
-    try:
-        # Initialize database tables if they don't exist
-        print("Connecting to database...")
-        conn, cur = logic.connect_db()
-        print("Setting up database...")
-        logic.setup_db(cur)
-        cur.close()
-        conn.close()
-        
-# server.py (Indentation Correction)
-# ...
-        
-        # Run the Flask app
-        print("Starting Flask app...")
-        if __name__ == "__main__": 
-            app.run()  # <-- Must be indented!
-    except Exception as e:
-        print(f"Error starting server: {e}")
+if __name__ == "__main__":
+    main()
