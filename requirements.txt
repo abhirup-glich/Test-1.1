@@ -1,12 +1,9 @@
 flask
 flask-cors
 gunicorn
-
-opencv-python-headless
-imutils
-psycopg2-binary
-tabulate
-
+numpy<2.0
 torch==2.1.2
 torchvision==0.16.2
 facenet-pytorch
+opencv-python-headless
+psycopg2-binary
