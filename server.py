@@ -520,5 +520,61 @@ def main():
 
 if __name__ == "__main__":
     main()
+@app.route("/health")
+def health():
+    return {"status": "ok"}
+
+@app.route("/register", methods=["POST"])
+def register_api():
+    data = request.json
+    conn, cur = connect_db()
+    res = register_student_web(
+        cur,
+        data["roll"],
+        data["name"],
+        data["course"],
+        data["images"]
+    )
+    cur.close()
+    conn.close()
+    return jsonify(res)
+
+@app.route("/attendance", methods=["POST"])
+def attendance_api():
+    data = request.json
+    emb = process_web_image(data["image"])
+    if emb is None:
+        return jsonify({"status": "no_face"})
+
+    conn, cur = connect_db()
+    students = load_students(cur)
+
+    best_score, best_student = -1, None
+    for s, embs in students:
+        for db_emb in embs:
+            score = cosine_sim(emb, db_emb)
+            if score > best_score:
+                best_score, best_student = score, s
+
+    if best_score > 0.6:
+        ts = datetime.now()
+        cur.execute(
+            "INSERT INTO attendance (roll,name,course,time,confidence) VALUES (%s,%s,%s,%s,%s)",
+            (best_student["roll"], best_student["name"], best_student["course"], ts, best_score)
+        )
+        cur.close()
+        conn.close()
+        return jsonify({
+            "status": "success",
+            "name": best_student["name"],
+            "roll": best_student["roll"],
+            "confidence": best_score,
+            "time": ts.isoformat()
+        })
+
+    cur.close()
+    conn.close()
+    return jsonify({"status": "unknown"})
+
 
 
