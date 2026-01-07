@@ -7,8 +7,6 @@ imutils
 psycopg2-binary
 tabulate
 
-dlib==19.24.2
-
 torch==2.1.2
 torchvision==0.16.2
 facenet-pytorch
