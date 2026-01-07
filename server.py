@@ -1,3 +1,4 @@
+from flask import Flask, request, jsonify
 import cv2
 import numpy as np
 import torch
@@ -12,7 +13,7 @@ from facenet_pytorch import MTCNN, InceptionResnetV1
 from tabulate import tabulate
 import argparse
 import os
-
+app = Flask(__name__)
 # ===================== CONFIG =====================
 
 DB_CONFIG = {
@@ -30,7 +31,6 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 exit_attendance = False
 
 # ===================== MODELS =====================
-
 mtcnn = MTCNN(keep_all=False, device=DEVICE)
 facenet = InceptionResnetV1(pretrained="vggface2").eval().to(DEVICE)
 # This path relies on 'shape_predictor_68_face_landmarks.dat' being in the same directory as logic.py
@@ -520,4 +520,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
